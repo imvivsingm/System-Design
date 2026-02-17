@@ -1,0 +1,474 @@
+# Multi-Tenant LSEG Real-Time Pricing Service - Design Document
+
+## 1. Overview
+
+A Spring Boot-based multi-tenant backend service that aggregates LSEG (Refinitiv) WebSocket connections and fans out real-time pricing updates to multiple end-users while maintaining only one upstream subscription per RIC.
+
+## 2. Architecture
+
+### 2.1 High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Client Layer                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ Client 1 │  │ Client 2 │  │ Client 3 │  │ Client N │       │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
+│       │             │             │             │               │
+│       └─────────────┴─────────────┴─────────────┘               │
+│                     │ WebSocket/SSE                              │
+└─────────────────────┼────────────────────────────────────────────┘
+                      │
+┌─────────────────────┼────────────────────────────────────────────┐
+│                     │         Application Layer                  │
+│     ┌───────────────▼──────────────────┐                         │
+│     │   WebSocket/SSE Controller       │                         │
+│     └───────────────┬──────────────────┘                         │
+│                     │                                             │
+│     ┌───────────────▼──────────────────┐                         │
+│     │   Subscription Manager Service   │                         │
+│     │  - Client subscription tracking   │                         │
+│     │  - RIC subscription deduplication│                         │
+│     │  - Fan-out coordination          │                         │
+│     └───────────────┬──────────────────┘                         │
+│                     │                                             │
+│     ┌───────────────▼──────────────────┐                         │
+│     │   LSEG Client Service            │                         │
+│     │  - Single WebSocket to LSEG      │                         │
+│     │  - Connection management         │                         │
+│     │  - Message parsing               │                         │
+│     └───────────────┬──────────────────┘                         │
+└─────────────────────┼────────────────────────────────────────────┘
+                      │
+                      │ WebSocket
+                      │
+┌─────────────────────▼────────────────────────────────────────────┐
+│                  LSEG (Refinitiv) API                             │
+│                  Real-Time Pricing Service                        │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Component Breakdown
+
+#### 2.2.1 WebSocket Controller Layer
+- **Purpose**: Handle client WebSocket connections
+- **Responsibilities**:
+  - Accept client WebSocket connections
+  - Authenticate and authorize clients
+  - Route subscription/unsubscription requests
+  - Send pricing updates to clients
+
+#### 2.2.2 Subscription Manager Service
+- **Purpose**: Core business logic for subscription management
+- **Responsibilities**:
+  - Track client-to-RIC mappings (many-to-many)
+  - Track RIC-to-client mappings for fan-out
+  - Coordinate upstream LSEG subscriptions
+  - Implement reference counting per RIC
+  - Cache latest pricing data per RIC
+  - Handle client disconnect cleanup
+
+#### 2.2.3 LSEG Client Service
+- **Purpose**: Manage upstream LSEG WebSocket connection
+- **Responsibilities**:
+  - Maintain single persistent WebSocket to LSEG
+  - Handle LSEG authentication and session management
+  - Subscribe/unsubscribe to RICs on LSEG
+  - Parse incoming pricing messages
+  - Publish updates to Subscription Manager
+  - Handle reconnection logic
+
+#### 2.2.4 Data Models
+- **ClientSession**: Represents a connected client
+- **RicSubscription**: Represents a RIC subscription state
+- **PricingUpdate**: Real-time pricing data
+- **SubscriptionRequest**: Client subscription message
+
+## 3. Key Data Structures
+
+### 3.1 Subscription Manager Internal State
+
+```java
+// RIC -> Set of Client Session IDs (who is subscribed)
+ConcurrentHashMap<String, Set<String>> ricToClients
+
+// Client Session ID -> Set of RICs (what they're subscribed to)
+ConcurrentHashMap<String, Set<String>> clientToRics
+
+// Client Session ID -> WebSocket Session
+ConcurrentHashMap<String, WebSocketSession> clientSessions
+
+// RIC -> Latest Pricing Data (for snapshot delivery)
+ConcurrentHashMap<String, PricingUpdate> latestData
+
+// RIC -> Subscription Status (SUBSCRIBING, ACTIVE, ERROR)
+ConcurrentHashMap<String, SubscriptionStatus> ricStatus
+
+// RIC -> Reference Count (for quick checking)
+ConcurrentHashMap<String, AtomicInteger> ricRefCount
+```
+
+## 4. Core Workflows
+
+### 4.1 Client Subscription Flow
+
+```
+Client                  Controller              SubscriptionManager         LSEGClient
+  │                         │                           │                        │
+  │──subscribe(RIC)────────>│                           │                        │
+  │                         │──subscribe(clientId,RIC)─>│                        │
+  │                         │                           │                        │
+  │                         │                           │──checkRefCount(RIC)    │
+  │                         │                           │  if count == 0         │
+  │                         │                           │──subscribe(RIC)───────>│
+  │                         │                           │                        │
+  │                         │                           │                        │──> LSEG API
+  │                         │                           │<──────ack──────────────│
+  │                         │                           │                        │
+  │                         │                           │──incrementRefCount─────│
+  │                         │                           │──addClientMapping──────│
+  │                         │                           │                        │
+  │                         │                           │──getSnapshot(RIC)──────│
+  │<────────snapshot────────│<──────snapshot────────────│                        │
+  │                         │                           │                        │
+```
+
+### 4.2 Pricing Update Fan-out Flow
+
+```
+LSEG API              LSEGClient          SubscriptionManager         Controller        Clients
+  │                       │                       │                        │              │
+  │──pricingUpdate(RIC)──>│                       │                        │              │
+  │                       │──onUpdate(RIC,data)──>│                        │              │
+  │                       │                       │──updateCache(RIC)      │              │
+  │                       │                       │──getSubscribers(RIC)   │              │
+  │                       │                       │  returns [c1,c2,c3]    │              │
+  │                       │                       │                        │              │
+  │                       │                       │──sendToClient(c1)─────>│──────────────>│
+  │                       │                       │──sendToClient(c2)─────>│──────────────>│
+  │                       │                       │──sendToClient(c3)─────>│──────────────>│
+```
+
+### 4.3 Client Unsubscription Flow
+
+```
+Client                Controller            SubscriptionManager           LSEGClient
+  │                       │                         │                          │
+  │──unsubscribe(RIC)────>│                         │                          │
+  │                       │──unsubscribe(cId,RIC)──>│                          │
+  │                       │                         │──decrementRefCount       │
+  │                       │                         │──removeClientMapping     │
+  │                       │                         │                          │
+  │                       │                         │──checkRefCount(RIC)      │
+  │                       │                         │  if count == 0           │
+  │                       │                         │──unsubscribe(RIC)───────>│
+  │                       │                         │                          │
+  │                       │                         │                          │──> LSEG API
+  │                       │                         │<────ack──────────────────│
+  │                       │                         │──clearCache(RIC)         │
+  │<───────ack────────────│<───────ack──────────────│                          │
+```
+
+### 4.4 Client Disconnect Flow
+
+```
+Client                Controller            SubscriptionManager           LSEGClient
+  │                       │                         │                          │
+  │───X disconnect        │                         │                          │
+  │                       │──onDisconnect(cId)─────>│                          │
+  │                       │                         │──getAllRics(cId)         │
+  │                       │                         │  returns [RIC1,RIC2]     │
+  │                       │                         │                          │
+  │                       │                         │──foreach RIC:            │
+  │                       │                         │  ──decrementRefCount     │
+  │                       │                         │  ──if count==0           │
+  │                       │                         │    ──unsubscribe(RIC)───>│
+  │                       │                         │                          │
+  │                       │                         │──removeClient(cId)       │
+```
+
+
+
+## 6. Key Design Patterns
+
+### 6.1 Observer Pattern
+- LSEG Client notifies Subscription Manager of updates
+- Subscription Manager notifies all subscribed clients
+
+### 6.2 Reference Counting Pattern
+- Track number of clients per RIC
+- Subscribe to LSEG when count: 0 → 1
+- Unsubscribe from LSEG when count: 1 → 0
+
+### 6.3 Fan-out Pattern
+- Single upstream message → Multiple downstream clients
+- Non-blocking async sends to clients
+
+### 6.4 Circuit Breaker Pattern
+- Handle LSEG connection failures
+- Automatic reconnection with backoff
+- Client notification of degraded service
+
+## 7. Thread Safety Considerations
+
+### 7.1 Concurrent Access
+- All shared data structures use `ConcurrentHashMap`
+- Atomic operations for reference counting
+- Synchronized blocks for multi-step operations
+
+### 7.2 Race Conditions to Handle
+1. **Concurrent subscribe/unsubscribe**: Use atomic ref count operations
+2. **Client disconnect during subscription**: Cleanup in finally blocks
+3. **LSEG reconnection**: Queue operations during downtime
+4. **Multiple updates for same RIC**: Sequential processing per RIC
+
+## 8. Error Handling Strategy
+
+### 8.1 Client-Side Errors
+- Invalid RIC format → Return error to client
+- Subscription limit exceeded → Reject with reason
+- Authentication failure → Close connection
+
+### 8.2 LSEG-Side Errors
+- Connection loss → Reconnect with exponential backoff
+- Subscription rejection → Notify subscribed clients
+- Rate limiting → Queue and retry
+- Invalid credentials → Alert and stop
+
+### 8.3 Internal Errors
+- Memory pressure → Implement max subscriptions per client
+- Thread pool exhaustion → Circuit breaker
+- Data structure corruption → Rebuild from current state
+
+## 9. Performance Optimization
+
+### 9.1 Message Processing
+- Async fan-out to clients (don't block LSEG thread)
+- Batch updates if high frequency (configurable)
+- Message compression for large payloads
+
+### 9.2 Memory Management
+- TTL-based cache eviction for inactive RICs
+- Limit max clients per RIC (configurable)
+- Limit max RICs per client (configurable)
+
+### 9.3 Network Optimization
+- WebSocket ping/pong for keepalive
+- Connection pooling
+- Message batching (optional)
+
+## 10. Scalability Considerations
+
+### 10.1 Single Instance Limits
+- Concurrent clients: ~10,000 (depends on hardware)
+- Active RICs: ~1,000 (depends on update frequency)
+- Messages/sec: ~100,000 (with proper tuning)
+
+### 10.2 Horizontal Scaling
+- Use Redis for shared subscription state
+- Sticky sessions for client connections
+- LSEG connection per instance (coordination needed)
+- Message broker (Kafka/RabbitMQ) for inter-instance communication
+
+### 10.3 Vertical Scaling
+- Increase heap size for more cached data
+- More CPU cores for parallel fan-out
+- Network bandwidth for high-frequency updates
+
+## 11. Monitoring & Metrics
+
+### 11.1 Key Metrics
+- **Subscription Metrics**:
+  - Active client connections
+  - Total RIC subscriptions
+  - RICs with subscribers
+  - Subscription/unsubscription rate
+  
+- **Performance Metrics**:
+  - Message latency (LSEG → Client)
+  - Fan-out time per RIC
+  - Update frequency per RIC
+  - Messages per second
+
+- **Health Metrics**:
+  - LSEG connection status
+  - Failed subscriptions
+  - Client disconnect rate
+  - Memory usage
+
+### 11.2 Alerting
+- LSEG connection down > 30 seconds
+- Subscription failure rate > 5%
+- Memory usage > 85%
+- Message latency > 1 second (p99)
+
+## 12. Configuration
+
+```yaml
+lseg:
+  websocket:
+    url: wss://api.refinitiv.com/streaming/pricing/v1
+    auth:
+      client-id: ${LSEG_CLIENT_ID}
+      client-secret: ${LSEG_CLIENT_SECRET}
+    reconnect:
+      max-attempts: 10
+      initial-delay: 1000
+      max-delay: 60000
+      multiplier: 2
+    heartbeat:
+      interval: 30000
+      timeout: 10000
+
+subscription:
+  limits:
+    max-rics-per-client: 100
+    max-clients-per-ric: 1000
+    max-total-subscriptions: 10000
+  cache:
+    ttl-minutes: 60
+    max-entries: 5000
+
+server:
+  websocket:
+    max-connections: 10000
+    max-frame-size: 65536
+    max-text-message-buffer-size: 65536
+    
+thread-pool:
+  core-size: 10
+  max-size: 50
+  queue-capacity: 1000
+  keep-alive-seconds: 60
+```
+
+## 13. API Design
+
+### 13.1 Client WebSocket Protocol
+
+**Connection**:
+```
+ws://localhost:8080/pricing/stream?token=<JWT>
+```
+
+**Subscribe Message**:
+```json
+{
+  "action": "subscribe",
+  "rics": ["AAPL.O", "MSFT.O", "GOOGL.O"]
+}
+```
+
+**Unsubscribe Message**:
+```json
+{
+  "action": "unsubscribe",
+  "rics": ["AAPL.O"]
+}
+```
+
+**Pricing Update (from server)**:
+```json
+{
+  "type": "update",
+  "ric": "AAPL.O",
+  "timestamp": "2024-02-17T10:30:00.123Z",
+  "data": {
+    "bid": 182.50,
+    "ask": 182.52,
+    "last": 182.51,
+    "volume": 1500000,
+    "change": 1.25,
+    "changePercent": 0.69
+  }
+}
+```
+
+**Snapshot (from server)**:
+```json
+{
+  "type": "snapshot",
+  "ric": "AAPL.O",
+  "timestamp": "2024-02-17T10:30:00.123Z",
+  "data": {
+    "bid": 182.50,
+    "ask": 182.52,
+    "last": 182.51,
+    "volume": 1500000,
+    "open": 181.00,
+    "high": 183.00,
+    "low": 180.50,
+    "close": 181.26
+  }
+}
+```
+
+**Error Message**:
+```json
+{
+  "type": "error",
+  "code": "SUBSCRIPTION_FAILED",
+  "message": "Failed to subscribe to RIC: INVALID.RIC",
+  "ric": "INVALID.RIC"
+}
+```
+
+### 13.2 REST API (Optional - Management)
+
+**GET /api/subscriptions/stats**
+```json
+{
+  "activeClients": 150,
+  "activeRics": 45,
+  "totalSubscriptions": 320,
+  "upstreamConnectionStatus": "CONNECTED"
+}
+```
+
+**GET /api/subscriptions/client/{clientId}**
+```json
+{
+  "clientId": "user123",
+  "connectedAt": "2024-02-17T09:00:00Z",
+  "subscribedRics": ["AAPL.O", "MSFT.O"],
+  "subscriptionCount": 2
+}
+```
+
+**GET /api/subscriptions/ric/{ric}**
+```json
+{
+  "ric": "AAPL.O",
+  "subscriberCount": 25,
+  "status": "ACTIVE",
+  "lastUpdate": "2024-02-17T10:30:00.123Z"
+}
+```
+
+## 14. Testing Strategy
+
+### 14.1 Unit Tests
+- Subscription Manager reference counting logic
+- Client mapping operations
+- Message parsing and serialization
+- Error handling paths
+
+### 14.2 Integration Tests
+- WebSocket connection lifecycle
+- Subscribe/unsubscribe flows
+- LSEG client mock integration
+- Concurrent subscription handling
+
+### 14.3 Load Tests
+- 1,000 concurrent clients
+- 100 RICs with varying subscription counts
+- High-frequency updates (100 msg/sec per RIC)
+- Client churn (connect/disconnect)
+
+### 14.4 Chaos Testing
+- LSEG connection drops
+- Client sudden disconnects
+- Network delays and packet loss
+- Memory pressure scenarios
+
+
