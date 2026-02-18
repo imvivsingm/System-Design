@@ -1,0 +1,1408 @@
+# LSEG Real-Time Pricing Service - REST API Design Document
+
+## 1. Overview
+
+A Spring Boot-based REST API service that provides on-demand real-time pricing data from LSEG (Refinitiv) WebSocket feed. The service maintains a persistent WebSocket connection to LSEG and handles concurrent REST requests efficiently through request coalescing and asynchronous processing.
+
+### Key Characteristics
+- **Client Interface**: REST API (POST endpoint)
+- **Upstream Connection**: Single persistent WebSocket to LSEG
+- **Processing Model**: Asynchronous, non-blocking
+- **Request Handling**: Request coalescing for same RIC
+- **Caching Strategy**: No caching (real-time only)
+- **Scalability**: Connection pooling for high concurrency
+
+---
+
+## 2. Architecture
+
+### 2.1 High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Client Layer                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ Trader 1 │  │ Trader 2 │  │ Trader 3 │  │ Trader N │       │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
+│       │             │             │             │               │
+│       └─────────────┴─────────────┴─────────────┘               │
+│                     │ REST POST /api/price                       │
+└─────────────────────┼────────────────────────────────────────────┘
+                      │
+┌─────────────────────┼────────────────────────────────────────────┐
+│                     │         Application Layer                  │
+│     ┌───────────────▼──────────────────┐                         │
+│     │      REST Price Controller       │                         │
+│     │  - Async request handling        │                         │
+│     │  - Timeout management            │                         │
+│     │  - Error handling                │                         │
+│     └───────────────┬──────────────────┘                         │
+│                     │                                             │
+│     ┌───────────────▼──────────────────┐                         │
+│     │   LSEG WebSocket Client Pool     │                         │
+│     │  - Request coalescing            │                         │
+│     │  - Connection management         │                         │
+│     │  - Response correlation          │                         │
+│     │  - Subscribe/Unsubscribe logic   │                         │
+│     └───────────────┬──────────────────┘                         │
+└─────────────────────┼────────────────────────────────────────────┘
+                      │
+                      │ WebSocket (Single or Pooled)
+                      │
+┌─────────────────────▼────────────────────────────────────────────┐
+│                  LSEG (Refinitiv) API                             │
+│                  Real-Time Pricing Service                        │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Component Breakdown
+
+#### 2.2.1 REST Price Controller
+- **Purpose**: Handle HTTP REST requests from traders
+- **Responsibilities**:
+  - Accept POST requests with RIC codes
+  - Delegate to LSEG WebSocket Client
+  - Return CompletableFuture for async processing
+  - Handle timeouts and errors
+  - Format responses
+
+#### 2.2.2 LSEG WebSocket Client (Single or Pooled)
+- **Purpose**: Manage WebSocket connection(s) to LSEG
+- **Responsibilities**:
+  - Maintain persistent WebSocket connection(s)
+  - Handle LSEG authentication and session management
+  - Coalesce concurrent requests for same RIC
+  - Track pending requests (request ID correlation)
+  - Subscribe/unsubscribe to RICs dynamically
+  - Parse and route incoming price updates
+  - Handle reconnection with exponential backoff
+  - Manage connection pool (if configured)
+
+---
+
+## 3. Core Data Structures
+
+### 3.1 LSEG WebSocket Client Internal State
+
+```java
+// RIC -> List of CompletableFutures waiting for price update
+// Multiple traders can wait for the same RIC
+ConcurrentHashMap<String, List<CompletableFuture<PriceData>>> pendingRequests
+
+// Track which RICs currently have active LSEG subscriptions
+// Used to prevent duplicate subscribe requests
+Set<String> activeSubscriptions (ConcurrentHashMap.newKeySet())
+
+// Optional: Connection pool for parallel processing
+List<WebSocketSession> connectionPool (if multi-connection enabled)
+
+// Optional: Round-robin counter for connection selection
+AtomicInteger connectionSelector
+```
+
+### 3.2 Request/Response Models
+
+```java
+// Client request
+class PriceRequest {
+    String ric;           // e.g., "AAPL.O"
+}
+
+// Service response
+class PriceResponse {
+    String ric;
+    BigDecimal bid;
+    BigDecimal ask;
+    BigDecimal last;
+    Long volume;
+    String timestamp;     // ISO 8601 format
+    Integer latencyMs;    // time from LSEG to response
+}
+
+// Internal price data
+class PriceData {
+    String ric;
+    BigDecimal bid;
+    BigDecimal ask;
+    BigDecimal last;
+    Long volume;
+    Instant timestamp;
+}
+```
+
+---
+
+## 4. Core Workflows
+
+### 4.1 Single Request Flow (No Coalescing)
+
+```
+Trader              REST Controller        LSEG Client           LSEG WebSocket
+  │                       │                      │                      │
+  │──POST /api/price─────>│                      │                      │
+  │   {ric:"AAPL.O"}      │                      │                      │
+  │                       │──getPrice(RIC)──────>│                      │
+  │                       │   returns Future     │                      │
+  │                       │                      │──check if subscribed │
+  │                       │                      │  (activeSubscriptions)
+  │                       │                      │                      │
+  │                       │                      │──create Future       │
+  │                       │                      │──add to pendingReqs  │
+  │                       │                      │                      │
+  │                       │                      │──subscribe(RIC)─────>│
+  │                       │                      │  (if not active)     │
+  │                       │                      │                      │
+  │                       │                      │<─price update────────│
+  │                       │                      │                      │
+  │                       │                      │──parse response      │
+  │                       │                      │──complete Future     │
+  │                       │                      │──remove from pending │
+  │                       │                      │                      │
+  │                       │                      │──unsubscribe(RIC)───>│
+  │                       │                      │  (no more pending)   │
+  │                       │<──PriceData──────────│                      │
+  │<──200 OK──────────────│                      │                      │
+  │   {price data}        │                      │                      │
+```
+
+### 4.2 Request Coalescing Flow (Multiple Traders, Same RIC)
+
+```
+Trader A   Trader B   Trader C      REST Controller    LSEG Client        LSEG
+  │          │          │                  │                  │              │
+  │──POST────┼──────────┼─────────────────>│                  │              │
+  │ AAPL.O   │          │                  │──getPrice────────>│              │
+  │          │          │                  │                  │──Future A    │
+  │          │          │                  │                  │──subscribe──>│
+  │          │          │                  │                  │ (active=true)│
+  │          │          │                  │                  │              │
+  │          │──POST────┼─────────────────>│                  │              │
+  │          │ AAPL.O   │  (10ms later)    │──getPrice────────>│              │
+  │          │          │                  │                  │──Future B    │
+  │          │          │                  │                  │──SKIP sub    │
+  │          │          │                  │                  │ (already active)
+  │          │          │                  │                  │              │
+  │          │          │──POST───────────>│                  │              │
+  │          │          │ AAPL.O (20ms)    │──getPrice────────>│              │
+  │          │          │                  │                  │──Future C    │
+  │          │          │                  │                  │──SKIP sub    │
+  │          │          │                  │                  │              │
+  │          │          │                  │                  │<─update──────│
+  │          │          │                  │                  │ (150ms later)│
+  │          │          │                  │                  │              │
+  │          │          │                  │                  │──complete A  │
+  │<─200─────┼──────────┼──────────────────│<─────────────────│──complete B  │
+  │          │<─200─────┼──────────────────│<─────────────────│──complete C  │
+  │          │          │<─200─────────────│<─────────────────│              │
+  │          │          │                  │                  │──unsub───────>│
+  │          │          │                  │                  │ (no pending) │
+```
+
+**Key Benefits:**
+- Only 1 LSEG subscription for 3 traders
+- All 3 traders get response at same time (~150ms)
+- Reduced load on LSEG API
+- No duplicate subscription errors
+
+### 4.3 Parallel Requests (Different RICs)
+
+```
+10 Traders (different RICs)     LSEG Client              LSEG WebSocket
+  │                                  │                          │
+  │──all send at t=0ms───────────────>│                          │
+  │  AAPL.O, MSFT.O, GOOGL.O, etc    │                          │
+  │                                  │                          │
+  │                                  │──10 Futures created      │
+  │                                  │──10 subscribe messages──>│
+  │                                  │  (all sent in parallel   │
+  │                                  │   via same WebSocket)    │
+  │                                  │                          │
+  │                                  │<─updates start arriving──│
+  │                                  │  (async, any order)      │
+  │                                  │                          │
+  │                                  │──complete Futures        │
+  │<──responses (all ~200ms)─────────│  as updates arrive       │
+```
+
+**Single WebSocket handles all 10 in parallel - no sequential blocking**
+
+### 4.4 Connection Pool Flow (Optional - High Concurrency)
+
+```
+100 Concurrent Requests       Connection Pool (10 WS)      LSEG
+  │                                 │                        │
+  │──100 requests arrive────────────>│                        │
+  │                                 │──round-robin select    │
+  │                                 │  Request 1  -> WS #0   │
+  │                                 │  Request 2  -> WS #1   │
+  │                                 │  ...                   │
+  │                                 │  Request 10 -> WS #9   │
+  │                                 │  Request 11 -> WS #0   │
+  │                                 │                        │
+  │                                 │──10 parallel subscribe─>│
+  │                                 │  batches               │
+  │                                 │                        │
+  │                                 │<─updates──────────────│
+  │<──responses─────────────────────│                        │
+```
+
+---
+
+## 5. Key Design Decisions
+
+### 5.1 Request Coalescing
+
+**Problem**: Multiple traders requesting same RIC simultaneously
+**Solution**: Track pending requests per RIC and share subscription
+
+**Implementation**:
+```java
+public CompletableFuture<PriceData> getPrice(String ric) {
+    CompletableFuture<PriceData> future = new CompletableFuture<>();
+    
+    // Add to pending requests list for this RIC
+    pendingRequests.computeIfAbsent(ric, k -> new CopyOnWriteArrayList<>())
+                   .add(future);
+    
+    // Only subscribe if this is the first request for this RIC
+    if (activeSubscriptions.add(ric)) {
+        sendSubscribeToLSEG(ric);
+    }
+    
+    return future;
+}
+
+// When LSEG responds
+void onPriceUpdate(String ric, PriceData data) {
+    List<CompletableFuture<PriceData>> waitingList = pendingRequests.remove(ric);
+    
+    if (waitingList != null) {
+        // Complete all waiting futures
+        waitingList.forEach(future -> future.complete(data));
+    }
+    
+    // Unsubscribe if no more pending requests
+    activeSubscriptions.remove(ric);
+    sendUnsubscribeToLSEG(ric);
+}
+```
+
+### 5.2 Asynchronous Processing
+
+**Why Not Blocking?**
+- Blocking ties up thread pool
+- 100 concurrent requests = 100 blocked threads
+- Thread exhaustion under load
+
+**Async Approach**:
+```java
+@RestController
+class PriceController {
+    
+    @PostMapping("/api/price")
+    public CompletableFuture<PriceResponse> getPrice(@RequestBody PriceRequest request) {
+        return lsegClient.getPriceAsync(request.getRic())
+                        .thenApply(this::mapToResponse)
+                        .orTimeout(5, TimeUnit.SECONDS)
+                        .exceptionally(this::handleError);
+    }
+}
+```
+
+### 5.3 WebSocket Message Correlation
+
+**Challenge**: Match async responses to original requests
+
+**Solution**: Request ID in LSEG message protocol
+```java
+// Send subscribe with ID
+{
+    "ID": "req-uuid-123",
+    "Type": "Subscribe",
+    "Domain": "MarketPrice",
+    "Key": { "Name": "AAPL.O" }
+}
+
+// Receive update with ID
+{
+    "ID": "req-uuid-123",
+    "Type": "Update",
+    "Fields": { "BID": 182.50, "ASK": 182.52 }
+}
+```
+
+Alternative if LSEG doesn't support request IDs: Use RIC as correlation key
+
+### 5.4 Connection Pooling Strategy
+
+**Single Connection (Default)**:
+- Simple
+- Handles 100+ concurrent requests fine
+- WebSocket is full-duplex and non-blocking
+
+**Multiple Connections (Optional)**:
+- Use when hitting LSEG rate limits
+- Example: "100 subscribe/sec per connection"
+- Round-robin distribution of requests
+
+**Configuration**:
+```yaml
+lseg:
+  connection-pool:
+    enabled: false        # Single connection by default
+    size: 10              # Number of WebSocket connections
+    selection: round-robin # or 'least-loaded'
+```
+
+---
+
+## 6. Error Handling Strategy
+
+### 6.1 Request-Level Errors
+
+```java
+// Timeout
+.orTimeout(5, TimeUnit.SECONDS)
+.exceptionally(ex -> {
+    if (ex instanceof TimeoutException) {
+        throw new ResponseStatusException(HttpStatus.GATEWAY_TIMEOUT, 
+            "LSEG did not respond in time");
+    }
+    return null;
+});
+
+// Invalid RIC
+if (response.getType().equals("Error")) {
+    throw new ResponseStatusException(HttpStatus.NOT_FOUND, 
+        "RIC not found: " + ric);
+}
+```
+
+### 6.2 Connection-Level Errors
+
+```java
+// WebSocket disconnect
+@OnClose
+void onClose() {
+    // Complete all pending futures with error
+    pendingRequests.values().forEach(list -> 
+        list.forEach(future -> 
+            future.completeExceptionally(new IOException("LSEG connection lost"))
+        )
+    );
+    
+    // Clear state
+    pendingRequests.clear();
+    activeSubscriptions.clear();
+    
+    // Reconnect
+    scheduleReconnect();
+}
+
+// Reconnection with exponential backoff
+private void scheduleReconnect() {
+    int attempt = reconnectAttempts.incrementAndGet();
+    long delay = Math.min(
+        initialDelay * (long) Math.pow(2, attempt),
+        maxDelay
+    );
+    
+    scheduler.schedule(this::connect, delay, TimeUnit.MILLISECONDS);
+}
+```
+
+### 6.3 Partial Failure Handling
+
+```java
+// If one subscription fails, don't fail all requests
+.exceptionally(ex -> {
+    if (ex instanceof SubscriptionFailedException) {
+        // Only fail requests for this specific RIC
+        failRequestsForRic(ric, ex);
+    }
+    return null;
+});
+```
+
+---
+
+## 7. Performance Optimization
+
+### 7.1 Request Processing
+
+**Async All The Way**:
+```java
+// Controller
+CompletableFuture<PriceResponse> (non-blocking)
+    ↓
+// LSEG Client  
+CompletableFuture<PriceData> (non-blocking)
+    ↓
+// WebSocket Handler
+Callbacks (event-driven)
+```
+
+**Benefits**:
+- Handle 1000s of concurrent requests
+- Minimal thread usage
+- No blocking I/O
+
+### 7.2 WebSocket Efficiency
+
+**Message Batching** (if LSEG supports):
+```java
+// Instead of 10 separate subscribe messages
+subscribe("AAPL.O")
+subscribe("MSFT.O")
+...
+
+// Send batch
+subscribe(["AAPL.O", "MSFT.O", "GOOGL.O", ...])
+```
+
+**Ping/Pong Keepalive**:
+```java
+@Scheduled(fixedRate = 30000)
+void sendHeartbeat() {
+    if (webSocketSession.isOpen()) {
+        webSocketSession.sendPing();
+    }
+}
+```
+
+### 7.3 Memory Management
+
+**Clean up completed futures**:
+```java
+void onPriceUpdate(String ric, PriceData data) {
+    List<CompletableFuture<PriceData>> waitingList = pendingRequests.remove(ric);
+    // ↑ REMOVE from map immediately after completing
+    
+    waitingList.forEach(future -> future.complete(data));
+    // Futures are now eligible for GC
+}
+```
+
+**Timeout cleanup**:
+```java
+future.orTimeout(5, TimeUnit.SECONDS)
+      .whenComplete((result, ex) -> {
+          // Auto-cleanup on timeout
+          pendingRequests.computeIfPresent(ric, (k, list) -> {
+              list.remove(future);
+              return list.isEmpty() ? null : list;
+          });
+      });
+```
+
+---
+
+## 8. Configuration
+
+```yaml
+# Application Configuration
+server:
+  port: 8080
+  
+spring:
+  application:
+    name: lseg-pricing-service
+
+# LSEG Configuration
+lseg:
+  websocket:
+    # Connection settings
+    url: wss://api.refinitiv.com/streaming/pricing/v1
+    auth:
+      client-id: ${LSEG_CLIENT_ID}
+      client-secret: ${LSEG_CLIENT_SECRET}
+      username: ${LSEG_USERNAME}
+      password: ${LSEG_PASSWORD}
+    
+    # Reconnection strategy
+    reconnect:
+      enabled: true
+      max-attempts: 10
+      initial-delay-ms: 1000
+      max-delay-ms: 60000
+      multiplier: 2.0
+    
+    # Heartbeat/keepalive
+    heartbeat:
+      interval-ms: 30000
+      timeout-ms: 10000
+    
+    # Connection pooling (optional)
+    connection-pool:
+      enabled: false
+      size: 10
+      selection-strategy: round-robin  # round-robin | least-loaded
+  
+  # Request handling
+  request:
+    default-timeout-ms: 5000
+    max-concurrent-requests: 1000
+
+# Thread Pool Configuration
+thread-pool:
+  core-size: 10
+  max-size: 50
+  queue-capacity: 1000
+  keep-alive-seconds: 60
+  thread-name-prefix: lseg-async-
+
+# Monitoring
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+# Logging
+logging:
+  level:
+    root: INFO
+    com.yourcompany.lseg: DEBUG
+    org.springframework.web.socket: DEBUG
+```
+
+---
+
+## 9. API Specification
+
+### 9.1 Get Real-Time Price
+
+**Endpoint**: `POST /api/price`
+
+**Request**:
+```json
+{
+  "ric": "AAPL.O"
+}
+```
+
+**Success Response** (200 OK):
+```json
+{
+  "ric": "AAPL.O",
+  "bid": 182.50,
+  "ask": 182.52,
+  "last": 182.51,
+  "volume": 1500000,
+  "timestamp": "2024-02-18T10:30:15.234Z",
+  "latencyMs": 145
+}
+```
+
+**Error Responses**:
+
+```json
+// 404 Not Found - Invalid RIC
+{
+  "timestamp": "2024-02-18T10:30:15.234Z",
+  "status": 404,
+  "error": "Not Found",
+  "message": "RIC not found: INVALID.RIC",
+  "path": "/api/price"
+}
+
+// 504 Gateway Timeout - LSEG timeout
+{
+  "timestamp": "2024-02-18T10:30:15.234Z",
+  "status": 504,
+  "error": "Gateway Timeout",
+  "message": "LSEG did not respond within 5 seconds",
+  "path": "/api/price"
+}
+
+// 503 Service Unavailable - LSEG connection down
+{
+  "timestamp": "2024-02-18T10:30:15.234Z",
+  "status": 503,
+  "error": "Service Unavailable",
+  "message": "LSEG connection unavailable, reconnecting...",
+  "path": "/api/price"
+}
+```
+
+### 9.2 Health Check (Optional)
+
+**Endpoint**: `GET /actuator/health`
+
+**Response**:
+```json
+{
+  "status": "UP",
+  "components": {
+    "lsegWebSocket": {
+      "status": "UP",
+      "details": {
+        "connectionState": "CONNECTED",
+        "activeSubscriptions": 15,
+        "pendingRequests": 3,
+        "lastHeartbeat": "2024-02-18T10:30:00.000Z"
+      }
+    }
+  }
+}
+```
+
+### 9.3 Metrics (Optional)
+
+**Endpoint**: `GET /actuator/metrics`
+
+**Key Metrics**:
+- `lseg.requests.total` - Total price requests
+- `lseg.requests.active` - Currently pending requests
+- `lseg.subscriptions.active` - Active LSEG subscriptions
+- `lseg.latency` - End-to-end latency (trader → response)
+- `lseg.connection.state` - WebSocket connection state
+- `lseg.errors.total` - Error count by type
+
+---
+
+## 10. Implementation Guide
+
+### 10.1 Technology Stack
+
+**Core**:
+- Spring Boot 3.x
+- Spring WebFlux (for async REST)
+- Java 17+
+
+**WebSocket**:
+- Spring WebSocket
+- or Tyrus (JSR-356)
+- or OkHttp WebSocket
+
+**Monitoring**:
+- Spring Boot Actuator
+- Micrometer + Prometheus
+- Grafana (optional)
+
+### 10.2 Project Structure
+
+```
+src/main/java/com/yourcompany/lseg/
+├── controller/
+│   └── PriceController.java           # REST endpoints
+├── service/
+│   ├── LSEGWebSocketClient.java       # WebSocket client
+│   └── LSEGConnectionPool.java        # Connection pool (optional)
+├── model/
+│   ├── PriceRequest.java
+│   ├── PriceResponse.java
+│   └── PriceData.java
+├── config/
+│   ├── LSEGConfig.java                # Configuration properties
+│   ├── AsyncConfig.java               # Thread pool config
+│   └── WebSocketConfig.java           # WebSocket config
+├── exception/
+│   ├── LSEGConnectionException.java
+│   ├── SubscriptionFailedException.java
+│   └── PriceNotFoundException.java
+└── metrics/
+    └── LSEGMetrics.java               # Custom metrics
+
+src/main/resources/
+├── application.yml
+└── logback-spring.xml
+```
+
+### 10.3 Key Classes
+
+**PriceController.java**:
+```java
+@RestController
+@RequestMapping("/api")
+public class PriceController {
+    
+    private final LSEGWebSocketClient lsegClient;
+    
+    @PostMapping("/price")
+    public CompletableFuture<PriceResponse> getPrice(
+            @RequestBody @Valid PriceRequest request) {
+        
+        return lsegClient.getPriceAsync(request.getRic())
+                .thenApply(this::mapToResponse)
+                .orTimeout(5, TimeUnit.SECONDS);
+    }
+    
+    private PriceResponse mapToResponse(PriceData data) {
+        return PriceResponse.builder()
+                .ric(data.getRic())
+                .bid(data.getBid())
+                .ask(data.getAsk())
+                .last(data.getLast())
+                .volume(data.getVolume())
+                .timestamp(data.getTimestamp().toString())
+                .build();
+    }
+}
+```
+
+**LSEGWebSocketClient.java**:
+```java
+@Service
+public class LSEGWebSocketClient {
+    
+    private final ConcurrentHashMap<String, List<CompletableFuture<PriceData>>> 
+        pendingRequests = new ConcurrentHashMap<>();
+    
+    private final Set<String> activeSubscriptions = 
+        ConcurrentHashMap.newKeySet();
+    
+    private WebSocketSession session;
+    
+    @PostConstruct
+    public void connect() {
+        // Establish WebSocket connection to LSEG
+        // Handle authentication
+        // Set up message handlers
+    }
+    
+    public CompletableFuture<PriceData> getPriceAsync(String ric) {
+        CompletableFuture<PriceData> future = new CompletableFuture<>();
+        
+        // Add to pending requests
+        pendingRequests.computeIfAbsent(ric, k -> new CopyOnWriteArrayList<>())
+                      .add(future);
+        
+        // Subscribe if needed
+        if (activeSubscriptions.add(ric)) {
+            sendSubscribe(ric);
+        }
+        
+        return future;
+    }
+    
+    @OnWebSocketMessage
+    public void onMessage(String message) {
+        LSEGMessage msg = parseMessage(message);
+        
+        if (msg.getType() == MessageType.UPDATE) {
+            handlePriceUpdate(msg);
+        }
+    }
+    
+    private void handlePriceUpdate(LSEGMessage msg) {
+        String ric = msg.getRic();
+        PriceData data = extractPriceData(msg);
+        
+        // Complete all waiting futures
+        List<CompletableFuture<PriceData>> waitingList = 
+            pendingRequests.remove(ric);
+        
+        if (waitingList != null) {
+            waitingList.forEach(future -> future.complete(data));
+            
+            // Unsubscribe if no more pending
+            activeSubscriptions.remove(ric);
+            sendUnsubscribe(ric);
+        }
+    }
+    
+    @OnWebSocketClose
+    public void onClose() {
+        // Complete all pending with exception
+        pendingRequests.values().forEach(list ->
+            list.forEach(future ->
+                future.completeExceptionally(
+                    new LSEGConnectionException("Connection lost")
+                )
+            )
+        );
+        
+        // Clear state
+        pendingRequests.clear();
+        activeSubscriptions.clear();
+        
+        // Reconnect
+        scheduleReconnect();
+    }
+}
+```
+
+---
+
+## 11. Testing Strategy
+
+### 11.1 Unit Tests
+
+**Request Coalescing**:
+```java
+@Test
+void testRequestCoalescing() {
+    // Arrange
+    String ric = "AAPL.O";
+    
+    // Act - Submit 3 concurrent requests
+    CompletableFuture<PriceData> f1 = client.getPriceAsync(ric);
+    CompletableFuture<PriceData> f2 = client.getPriceAsync(ric);
+    CompletableFuture<PriceData> f3 = client.getPriceAsync(ric);
+    
+    // Simulate LSEG response
+    simulateLSEGUpdate(ric, mockPriceData);
+    
+    // Assert - All 3 futures completed
+    assertThat(f1).isCompletedWithValue(mockPriceData);
+    assertThat(f2).isCompletedWithValue(mockPriceData);
+    assertThat(f3).isCompletedWithValue(mockPriceData);
+    
+    // Assert - Only 1 subscribe call made
+    verify(lsegSession, times(1)).sendSubscribe(ric);
+}
+```
+
+**Timeout Handling**:
+```java
+@Test
+void testRequestTimeout() {
+    // Act
+    CompletableFuture<PriceData> future = client.getPriceAsync("AAPL.O")
+            .orTimeout(1, TimeUnit.SECONDS);
+    
+    // Don't simulate LSEG response - let it timeout
+    
+    // Assert
+    assertThatThrownBy(future::get)
+            .hasCauseInstanceOf(TimeoutException.class);
+}
+```
+
+### 11.2 Integration Tests
+
+**End-to-End Flow**:
+```java
+@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
+class PriceControllerIT {
+    
+    @Autowired
+    private TestRestTemplate restTemplate;
+    
+    @MockBean
+    private LSEGWebSocketClient lsegClient;
+    
+    @Test
+    void testGetPrice() {
+        // Arrange
+        when(lsegClient.getPriceAsync("AAPL.O"))
+                .thenReturn(CompletableFuture.completedFuture(mockData));
+        
+        // Act
+        ResponseEntity<PriceResponse> response = restTemplate.postForEntity(
+                "/api/price",
+                new PriceRequest("AAPL.O"),
+                PriceResponse.class
+        );
+        
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody().getRic()).isEqualTo("AAPL.O");
+    }
+}
+```
+
+### 11.3 Load Tests
+
+**JMeter/Gatling Script**:
+```scala
+// 100 concurrent traders
+// 10 different RICs
+// 1000 requests total
+val scn = scenario("Price Requests")
+  .repeat(10) {
+    exec(
+      http("Get Price")
+        .post("/api/price")
+        .body(StringBody("""{"ric":"AAPL.O"}"""))
+        .check(status.is(200))
+    )
+  }
+
+setUp(
+  scn.inject(atOnceUsers(100))
+).protocols(httpProtocol)
+```
+
+**Expected Results**:
+- Throughput: > 500 req/sec
+- p50 latency: < 200ms
+- p99 latency: < 500ms
+- Error rate: < 1%
+
+### 11.4 Chaos Testing
+
+**Connection Failure**:
+```java
+@Test
+void testReconnection() {
+    // Arrange - connected
+    assertThat(client.isConnected()).isTrue();
+    
+    // Act - simulate disconnect
+    client.forceDisconnect();
+    
+    // Assert - auto-reconnect
+    await().atMost(10, SECONDS)
+           .until(() -> client.isConnected());
+}
+```
+
+**Partial Failure**:
+```java
+@Test
+void testPartialFailure() {
+    // Arrange
+    CompletableFuture<PriceData> f1 = client.getPriceAsync("AAPL.O");
+    CompletableFuture<PriceData> f2 = client.getPriceAsync("INVALID.RIC");
+    
+    // Act - AAPL succeeds, INVALID fails
+    simulateLSEGUpdate("AAPL.O", mockData);
+    simulateLSEGError("INVALID.RIC", "Not found");
+    
+    // Assert - f1 succeeds, f2 fails, other requests unaffected
+    assertThat(f1).isCompletedWithValue(mockData);
+    assertThat(f2).isCompletedExceptionally();
+}
+```
+
+---
+
+## 12. Monitoring & Observability
+
+### 12.1 Key Metrics
+
+**Request Metrics**:
+```java
+@Component
+public class LSEGMetrics {
+    
+    private final Counter requestsTotal;
+    private final Gauge pendingRequests;
+    private final Timer requestLatency;
+    private final Counter errorsTotal;
+    
+    public LSEGMetrics(MeterRegistry registry) {
+        this.requestsTotal = Counter.builder("lseg.requests.total")
+                .description("Total price requests")
+                .register(registry);
+        
+        this.pendingRequests = Gauge.builder("lseg.requests.pending")
+                .description("Currently pending requests")
+                .register(registry, pendingRequestsMap, Map::size);
+        
+        this.requestLatency = Timer.builder("lseg.request.latency")
+                .description("Request latency")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry);
+        
+        this.errorsTotal = Counter.builder("lseg.errors.total")
+                .description("Total errors")
+                .tag("type", "timeout")
+                .register(registry);
+    }
+}
+```
+
+**Connection Metrics**:
+- `lseg.connection.state` - Connection state (0=disconnected, 1=connected)
+- `lseg.reconnect.attempts` - Reconnection attempt count
+- `lseg.subscriptions.active` - Active LSEG subscriptions
+- `lseg.heartbeat.last` - Last heartbeat timestamp
+
+### 12.2 Logging
+
+**Structured Logging**:
+```java
+log.info("Price request received", 
+         kv("ric", ric), 
+         kv("requestId", requestId));
+
+log.info("LSEG update received", 
+         kv("ric", ric), 
+         kv("latencyMs", latency));
+
+log.error("LSEG connection failed", 
+          kv("attemptNumber", attempt), 
+          kv("nextRetryMs", delay));
+```
+
+### 12.3 Alerting
+
+**Critical Alerts**:
+- LSEG connection down > 1 minute
+- Error rate > 5% over 5 minutes
+- p99 latency > 2 seconds
+- Pending requests > 1000
+
+**Warning Alerts**:
+- Reconnection attempts > 3
+- Error rate > 2% over 5 minutes
+- p99 latency > 1 second
+
+---
+
+## 13. Deployment
+
+### 13.1 Container Configuration
+
+**Dockerfile**:
+```dockerfile
+FROM eclipse-temurin:17-jre-alpine
+
+WORKDIR /app
+
+COPY target/lseg-pricing-service.jar app.jar
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/actuator/health || exit 1
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", \
+  "-XX:+UseG1GC", \
+  "-XX:MaxRAMPercentage=75.0", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]
+```
+
+**docker-compose.yml** (for local testing):
+```yaml
+version: '3.8'
+
+services:
+  lseg-pricing-service:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - LSEG_CLIENT_ID=${LSEG_CLIENT_ID}
+      - LSEG_CLIENT_SECRET=${LSEG_CLIENT_SECRET}
+      - SPRING_PROFILES_ACTIVE=docker
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+```
+
+### 13.2 Kubernetes Deployment
+
+**deployment.yaml**:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lseg-pricing-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: lseg-pricing-service
+  template:
+    metadata:
+      labels:
+        app: lseg-pricing-service
+    spec:
+      containers:
+      - name: app
+        image: lseg-pricing-service:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: LSEG_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: lseg-secrets
+              key: client-id
+        - name: LSEG_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: lseg-secrets
+              key: client-secret
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+```
+
+**service.yaml**:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: lseg-pricing-service
+spec:
+  selector:
+    app: lseg-pricing-service
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+  type: LoadBalancer
+```
+
+### 13.3 Environment-Specific Configuration
+
+**application-dev.yml**:
+```yaml
+lseg:
+  websocket:
+    url: wss://api-dev.refinitiv.com/streaming/pricing/v1
+  request:
+    default-timeout-ms: 10000  # More lenient in dev
+
+logging:
+  level:
+    com.yourcompany.lseg: DEBUG
+```
+
+**application-prod.yml**:
+```yaml
+lseg:
+  websocket:
+    url: wss://api.refinitiv.com/streaming/pricing/v1
+    connection-pool:
+      enabled: true
+      size: 10
+  request:
+    default-timeout-ms: 5000
+
+logging:
+  level:
+    com.yourcompany.lseg: INFO
+```
+
+---
+
+## 14. Future Enhancements
+
+### 14.1 Phase 2: WebSocket API for Clients
+
+Replace REST with WebSocket for true streaming:
+```
+Trader (WebSocket) ↔ Service (WebSocket) ↔ LSEG (WebSocket)
+```
+
+Benefits:
+- Real-time streaming (no polling)
+- Lower latency
+- Reduced overhead
+- Natural fit for pricing data
+
+### 14.2 Caching Layer (Optional)
+
+If requirements change to allow caching:
+```java
+// Short-lived cache (1 second TTL)
+@Cacheable(value = "prices", unless = "#result.age > 1000")
+public PriceData getPrice(String ric) {
+    // ...
+}
+```
+
+### 14.3 Historical Data Support
+
+```java
+@GetMapping("/api/price/history")
+public List<PriceData> getHistory(
+        @RequestParam String ric,
+        @RequestParam Instant from,
+        @RequestParam Instant to) {
+    // Query time-series database
+}
+```
+
+### 14.4 Multi-Region Deployment
+
+- Active-passive LSEG connections
+- Regional failover
+- Geo-routing for traders
+
+---
+
+## 15. Security Considerations
+
+### 15.1 Authentication
+
+```java
+@PostMapping("/api/price")
+@PreAuthorize("hasRole('TRADER')")
+public CompletableFuture<PriceResponse> getPrice(
+        @RequestBody PriceRequest request,
+        Authentication auth) {
+    // ...
+}
+```
+
+### 15.2 Rate Limiting
+
+```java
+@Bean
+public RateLimiter rateLimiter() {
+    return RateLimiter.create(100.0); // 100 req/sec per service
+}
+
+// Per-user rate limiting
+private final LoadingCache<String, RateLimiter> userLimiters = 
+    CacheBuilder.newBuilder()
+        .expireAfterAccess(10, TimeUnit.MINUTES)
+        .build(new CacheLoader<String, RateLimiter>() {
+            public RateLimiter load(String userId) {
+                return RateLimiter.create(10.0); // 10 req/sec per user
+            }
+        });
+```
+
+### 15.3 Input Validation
+
+```java
+@Data
+public class PriceRequest {
+    @NotBlank
+    @Pattern(regexp = "^[A-Z0-9.]+$", message = "Invalid RIC format")
+    @Size(max = 20)
+    private String ric;
+}
+```
+
+### 15.4 LSEG Credentials
+
+```yaml
+# Use external secrets management
+lseg:
+  websocket:
+    auth:
+      client-id: ${LSEG_CLIENT_ID}       # From AWS Secrets Manager
+      client-secret: ${LSEG_CLIENT_SECRET} # From AWS Secrets Manager
+```
+
+---
+
+## 16. Troubleshooting Guide
+
+### 16.1 Common Issues
+
+**Issue**: Requests timing out
+- Check LSEG connection status
+- Verify network connectivity
+- Check timeout configuration
+- Review LSEG API rate limits
+
+**Issue**: Memory leak
+- Check `pendingRequests` map size
+- Verify timeout cleanup is working
+- Enable heap dump on OOM
+- Review Future cleanup logic
+
+**Issue**: Connection keeps dropping
+- Check LSEG heartbeat configuration
+- Verify firewall/proxy settings
+- Review reconnection backoff settings
+- Check LSEG session limits
+
+### 16.2 Debug Commands
+
+```bash
+# Check health
+curl http://localhost:8080/actuator/health
+
+# View metrics
+curl http://localhost:8080/actuator/metrics/lseg.requests.pending
+
+# Thread dump
+jstack <pid> > thread-dump.txt
+
+# Heap dump
+jmap -dump:live,format=b,file=heap.hprof <pid>
+```
+
+---
+
+## 17. Appendix
+
+### 17.1 LSEG WebSocket Protocol Reference
+
+**Authentication**:
+```json
+{
+  "ID": 1,
+  "Domain": "Login",
+  "Key": {
+    "Name": "username",
+    "Elements": {
+      "ApplicationId": "256",
+      "Position": "127.0.0.1"
+    }
+  }
+}
+```
+
+**Subscribe**:
+```json
+{
+  "ID": 2,
+  "Domain": "MarketPrice",
+  "Key": {
+    "Name": "AAPL.O",
+    "Service": "ELEKTRON_DD"
+  }
+}
+```
+
+**Update**:
+```json
+{
+  "ID": 2,
+  "Type": "Update",
+  "Key": {
+    "Name": "AAPL.O"
+  },
+  "Fields": {
+    "BID": 182.50,
+    "ASK": 182.52,
+    "TRDPRC_1": 182.51,
+    "ACVOL_1": 1500000
+  }
+}
+```
+
+### 17.2 Glossary
+
+- **RIC**: Reuters Instrument Code (e.g., "AAPL.O" for Apple on NASDAQ)
+- **LSEG**: London Stock Exchange Group (formerly Refinitiv)
+- **Request Coalescing**: Combining multiple requests for the same resource
+- **CompletableFuture**: Java async programming construct
+- **WebSocket**: Full-duplex communication protocol
+- **DXA**: Document Units (1440 DXA = 1 inch)
+
+---
+
+## Document Version
+
+**Version**: 1.0  
+**Date**: February 18, 2026  
+**Author**: Architecture Team  
+**Status**: Approved for Implementation
